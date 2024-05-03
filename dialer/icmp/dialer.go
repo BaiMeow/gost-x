@@ -82,7 +82,7 @@ func (d *icmpDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 			raddr.Port = id
 		}
 		if d.md.seqBySeqMode {
-			pc = icmp_pkg.ClientConn2(pc, raddr)
+			pc = icmp_pkg.ClientConn2(pc, raddr, d.md.minAirSeq, d.md.maxAirSeq)
 		} else {
 			pc = icmp_pkg.ClientConn(pc, id)
 		}

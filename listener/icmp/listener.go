@@ -57,7 +57,7 @@ func (l *icmpListener) Init(md md.Metadata) (err error) {
 		return
 	}
 	if l.md.seqBySeqMode {
-		conn = icmp_pkg.ServerConn2(conn)
+		conn = icmp_pkg.ServerConn2(conn, l.md.seqQueueSize)
 	} else {
 		conn = icmp_pkg.ServerConn(conn)
 	}

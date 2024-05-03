@@ -2,7 +2,6 @@ package icmp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/go-gost/core/common/bufpool"
 	"github.com/go-gost/core/logger"
@@ -10,38 +9,53 @@ import (
 	"golang.org/x/net/ipv4"
 	"math"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	AirSeqCount = 8
 	BufQueueLen = 1024
+	BoostPeriod = 500 * time.Millisecond
 )
 
 type clientConn2 struct {
 	net.PacketConn
 	raddr    *net.UDPAddr
 	bufQueue chan []byte
-	seq      uint32
-	peerSeq  uint32
-	cancel   context.CancelFunc
-	ctx      context.Context
+	// seq is uint16 but only uint32 has atomic operation
+	seq     uint32
+	peerSeq uint32
+	cancel  context.CancelFunc
+	ctx     context.Context
+
+	airSeqCount    int
+	minAirSeqCount int
+	maxAirSeqCount int
+
+	seqTicker  *time.Ticker
+	readCouter atomic.Uint32
 }
 
-func ClientConn2(conn net.PacketConn, raddr *net.UDPAddr) net.PacketConn {
+func (c *clientConn2) LocalAddr() net.Addr {
+	return c.raddr
+}
+
+func ClientConn2(conn net.PacketConn, raddr *net.UDPAddr, minAirSeqCount int, maxAirSeqCount int) net.PacketConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &clientConn2{
-		PacketConn: conn,
-		raddr:      raddr,
-		cancel:     cancel,
-		bufQueue:   make(chan []byte, BufQueueLen),
-		ctx:        ctx,
+		PacketConn:     conn,
+		raddr:          raddr,
+		cancel:         cancel,
+		bufQueue:       make(chan []byte, BufQueueLen),
+		ctx:            ctx,
+		airSeqCount:    minAirSeqCount,
+		minAirSeqCount: minAirSeqCount,
+		maxAirSeqCount: maxAirSeqCount,
+		seqTicker:      time.NewTicker(BoostPeriod / time.Duration(minAirSeqCount)),
 	}
-	c.PacketConn.SetReadDeadline(time.Now().Add(time.Second * 10))
-	c.readDaemon(ctx)
+	go c.SeqKeeper()
+	go c.Booster()
 	return c
 }
 
@@ -50,45 +64,62 @@ func (c *clientConn2) Close() error {
 	return c.PacketConn.Close()
 }
 
-func (c *clientConn2) readDaemon(ctx context.Context) {
-	buf := bufpool.Get(readBufferSize)
-	defer bufpool.Put(buf)
-	defer c.cancel()
+func (c *clientConn2) SeqKeeper() {
 	for {
 		select {
-		case <-ctx.Done():
+		case <-c.ctx.Done():
+			c.seqTicker.Stop()
 			return
-		default:
-		}
-		// keepalive check
-		for c.seq-c.peerSeq < AirSeqCount {
+		case <-c.seqTicker.C:
 			if _, err := c.WriteTo(nil, c.raddr); err != nil {
 				logger.Default().Error(err)
 				return
 			}
 		}
+	}
 
-		// read pkg
-		n, addr, err := c.PacketConn.ReadFrom(buf)
+}
+
+func (c *clientConn2) Booster() {
+	tBoost := time.NewTicker(BoostPeriod)
+	for {
+		select {
+		case <-c.ctx.Done():
+			tBoost.Stop()
+			return
+		case <-tBoost.C:
+			count := c.readCouter.Swap(0)
+			// ensure fold [0,1]
+			fold := min(float64(count)/float64(c.airSeqCount), 1)
+			calc := math.Round((math.Pow(fold, 1.6)-0.5)*float64(c.airSeqCount) + float64(c.airSeqCount))
+			calc = min(max(calc, float64(c.minAirSeqCount)), float64(c.maxAirSeqCount))
+			logger.Default().Debugf("icmp: air seq count %d", int(calc))
+			c.airSeqCount = int(calc)
+			c.cancelSeqOnce()
+		}
+	}
+
+}
+
+func (c *clientConn2) cancelSeqOnce() {
+	c.seqTicker.Reset(BoostPeriod / time.Duration(c.airSeqCount))
+}
+
+func (c *clientConn2) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	buf := bufpool.Get(readBufferSize)
+	defer bufpool.Put(buf)
+
+	for {
+		n, addr, err = c.PacketConn.ReadFrom(buf)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
-			}
-			logger.Default().Error(err)
+			c.Close()
 			return
 		}
-		v, ok := addr.(*net.IPAddr)
-		if !ok {
-			continue
-		}
-		if !v.IP.Equal(c.raddr.IP) {
-			continue
-		}
+
 		m, err := icmp.ParseMessage(1, buf[:n])
 		if err != nil {
-			// in fact, pk from icmp conn should always match icmp format
 			// logger.Default().Error("icmp: parse message %v", err)
-			continue
+			return 0, addr, err
 		}
 		echo, ok := m.Body.(*icmp.Echo)
 		if !ok || m.Type != ipv4.ICMPTypeEchoReply {
@@ -100,18 +131,11 @@ func (c *clientConn2) readDaemon(ctx context.Context) {
 			continue
 		}
 
-		// there is only one goroutine to read from the conn, so no need to lock or atomic
-		if uint32(echo.Seq) > c.peerSeq {
-			c.peerSeq = uint32(echo.Seq)
-		}
+		c.readCouter.Add(1)
 
 		msg := message{}
 		if _, err := msg.Decode(echo.Data); err != nil {
 			logger.Default().Warn(err)
-			continue
-		}
-
-		if msg.flags&FlagKeepAlive > 0 {
 			continue
 		}
 
@@ -120,22 +144,23 @@ func (c *clientConn2) readDaemon(ctx context.Context) {
 			continue
 		}
 
-		// if full, drop packet
-		select {
-		case c.bufQueue <- msg.data:
-		default:
+		if msg.flags&FlagKeepAlive > 0 {
+			continue
+		}
+
+		n = copy(b, msg.data)
+		break
+	}
+
+	if v, ok := addr.(*net.IPAddr); ok {
+		addr = &net.UDPAddr{
+			IP:   v.IP,
+			Port: c.raddr.Port,
 		}
 	}
-}
+	// logger.Default().Infof("icmp: read from: %v %d", addr, n)
 
-func (c *clientConn2) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	select {
-	case <-c.ctx.Done():
-		return 0, nil, c.ctx.Err()
-	case buf := <-c.bufQueue:
-		n = copy(b, buf)
-		return n, c.raddr, nil
-	}
+	return
 }
 
 func (c *clientConn2) WriteTo(b []byte, addr net.Addr) (n int, err error) {
@@ -161,7 +186,7 @@ func (c *clientConn2) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 
 	echo := icmp.Echo{
 		ID:   c.raddr.Port,
-		Seq:  int(atomic.AddUint32(&c.seq, 1)),
+		Seq:  int(uint16(atomic.AddUint32(&c.seq, 1))),
 		Data: buf[:nn],
 	}
 	m := icmp.Message{
@@ -173,25 +198,28 @@ func (c *clientConn2) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	if err != nil {
 		return 0, err
 	}
+	c.cancelSeqOnce()
 	_, err = c.PacketConn.WriteTo(wb, addr)
 	n = len(b)
 	return
 }
 
 type client struct {
-	id  uint16
-	seq chan uint32
+	id   uint16
+	seqC *queue[uint16]
 }
 
 type serverConn2 struct {
 	net.PacketConn
 	// it's bad to create 65535 channels, so just turns to use sync.Map
-	clients sync.Map
+	clients      sync.Map
+	seqQueueSize int
 }
 
-func ServerConn2(conn net.PacketConn) net.PacketConn {
+func ServerConn2(conn net.PacketConn, seqQueueSize int) net.PacketConn {
 	return &serverConn2{
-		PacketConn: conn,
+		PacketConn:   conn,
+		seqQueueSize: seqQueueSize,
 	}
 }
 
@@ -219,23 +247,10 @@ func (c *serverConn2) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 
 		cl, ok := c.clients.Load(echo.ID)
 		if !ok {
-			cl, _ = c.clients.LoadOrStore(echo.ID, &client{id: uint16(echo.ID), seq: make(chan uint32, AirSeqCount)})
+			cl, _ = c.clients.LoadOrStore(echo.ID, &client{id: uint16(echo.ID), seqC: newQueue[uint16](c.seqQueueSize)})
 		}
-		seqC := cl.(*client).seq
 
-	ENQUEUE:
-		select {
-		case seqC <- uint32(echo.Seq):
-		default:
-			for {
-				<-seqC
-				select {
-				case seqC <- uint32(echo.Seq):
-					break ENQUEUE
-				default:
-				}
-			}
-		}
+		cl.(*client).seqC.Write(uint16(echo.Seq))
 
 		msg := message{}
 		if _, err := msg.Decode(echo.Data); err != nil {
@@ -299,7 +314,7 @@ func (c *serverConn2) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	}
 	echo := icmp.Echo{
 		ID:   id,
-		Seq:  int(<-cl.(*client).seq),
+		Seq:  int(cl.(*client).seqC.Read()),
 		Data: buf[:nn],
 	}
 	m := icmp.Message{

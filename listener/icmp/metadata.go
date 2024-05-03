@@ -8,7 +8,8 @@ import (
 )
 
 const (
-	defaultBacklog = 128
+	defaultBacklog      = 128
+	defaultSeqQueueSize = 8
 )
 
 type metadata struct {
@@ -18,6 +19,7 @@ type metadata struct {
 
 	backlog      int
 	seqBySeqMode bool
+	seqQueueSize int
 }
 
 func (l *icmpListener) parseMetadata(md mdata.Metadata) (err error) {
@@ -27,8 +29,10 @@ func (l *icmpListener) parseMetadata(md mdata.Metadata) (err error) {
 		handshakeTimeout = "handshakeTimeout"
 		maxIdleTimeout   = "maxIdleTimeout"
 
-		backlog      = "backlog"
+		backlog = "backlog"
+
 		seqBySeqMode = "seqBySeqMode"
+		seqQueueSize = "seqQueueSize"
 	)
 
 	l.md.backlog = mdutil.GetInt(md, backlog)
@@ -49,5 +53,9 @@ func (l *icmpListener) parseMetadata(md mdata.Metadata) (err error) {
 		l.md.seqBySeqMode = true
 	}
 
+	l.md.seqQueueSize = mdutil.GetInt(md, seqQueueSize)
+	if l.md.seqQueueSize <= 0 {
+		l.md.seqQueueSize = defaultSeqQueueSize
+	}
 	return
 }
